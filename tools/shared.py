@@ -32,6 +32,7 @@ DFE = path_from_root('tools', 'dead_function_eliminator.py')
 BINDINGS_GENERATOR = path_from_root('tools', 'bindings_generator.py')
 EXEC_LLVM = path_from_root('tools', 'exec_llvm.py')
 VARIABLE_ELIMINATOR = path_from_root('tools', 'eliminator', 'eliminator.coffee')
+JS_OPTIMIZER = path_from_root('tools', 'js-optimizer.js')
 
 # Additional compiler options
 
@@ -291,7 +292,7 @@ class Building:
       into i64s. In any case, the handpicked ones here should be safe and portable. They are also tuned for
       things that look useful.
     '''
-    if not Building.LLVM_OPTS: return
+    if not Building.LLVM_OPTS: return # XXX this makes using this independently from the test runner very unpleasant
 
     opts = []
     if optimization_level > 0:
@@ -372,4 +373,5 @@ class Building:
         if optimization_level > 1: opts.append('-constmerge')
 
     Building.LLVM_OPT_OPTS = opts
+    return opts
 

@@ -675,12 +675,14 @@ function analyzer(data) {
                   if (lastLine.intertype == 'assign') lastLine = lastLine.value;
                   assert(lastLine.intertype in LLVM.PHI_REACHERS, 'Only some can lead to labels with phis:' + [func.ident, label.ident, lastLine.intertype]);
                   if (!lastLine.phi) {
-                    // We store the phi assignments in the branch's params (which are otherwise unused)
                     lastLine.phi = true;
-                    assert(!lastLine.params);
-                    lastLine.params = [];
+                    assert(!lastLine.dependent);
+                    lastLine.dependent = {
+                      intertype: 'phiassigns',
+                      params: []
+                    };
                   };
-                  lastLine.params.push({
+                  lastLine.dependent.params.push({
                     intertype: 'phiassign',
                     ident: line.ident,
                     value: param.value,
