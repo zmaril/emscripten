@@ -1,0 +1,431 @@
+#!/usr/bin/env python
+
+'''
+emfortran - compiler helper script
+=============================
+
+emfortran is a drop-in replacement for a compiler like gfortran.
+For more info see docs in emcc script. 
+'''
+
+import os, sys, shutil, tempfile
+from subprocess import Popen, PIPE, STDOUT
+from tools import shared
+
+DEBUG = os.environ.get('EMCC_DEBUG') #Not touching this quite yet
+TEMP_DIR = os.environ.get('EMCC_TEMP_DIR') #Or that 
+
+if DEBUG: print >> sys.stderr, 'emfortran: ', ' '.join(sys.argv)
+
+shared.check_sanity()
+
+# Handle some global flags
+
+if len(sys.argv) == 1:
+  print 'emfortran: no input files'
+  exit(0)
+
+if sys.argv[1] == '--version':
+  print '''emfortran (Emscripten gfortran-like replacement) 2.0
+Copyright (C) 2011 the Emscripten authors.
+This is free and open source software under the MIT license.
+There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+  '''
+  exit(0)
+elif sys.argv[1] == '--help':
+  this = os.path.basename('emfortran')
+
+  print '''%s [options] file...
+
+Most normal gcc/g++ options will work, for example:
+  --help                   Display this information
+  --version                Display compiler version information
+
+Options that are modified or new in %s include:
+  -O0                      No optimizations (default)
+  -O1                      Simple optimizations, including safe LLVM
+                           optimizations, and no runtime assertions
+                           or C++ exception catching (to re-enable
+                           C++ exception catching, use
+                           -s DISABLE_EXCEPTION_CATCHING=0 )
+  -O2                      As -O1, plus the relooper (loop recreation),
+                           plus closure compiler advanced opts
+                           Warning: Compiling with this takes a long time!
+  -O3                      As -O2, plus dangerous optimizations that may
+                           break the generated code! If that happens, try
+                           -O2 and then adding dangerous optimizations one
+                           by one.
+  -s OPTION=VALUE          JavaScript code generation option passed
+                           into the emscripten compiler
+  --typed-arrays <mode>    0: No typed arrays
+                           1: Parallel typed arrays
+                           2: Shared (C-like) typed arrays (default)
+  --llvm-opts <level>      0: No LLVM optimizations (default in -O0)
+                           1: Safe/portable LLVM optimizations
+                              (default in -O1 and above)
+                           2: Full, unsafe/unportable LLVM optimizations;
+                              this will almost certainly break the
+                              generated code!
+  --closure <on>           0: No closure compiler (default in -O0, -O1)
+                           1: Run closure compiler (default in -O2, -O3)
+
+The target file, if specified (-o <target>), defines what will
+be generated:
+
+  <name>.js                JavaScript (default)
+  <name>.html              HTML with embedded JavaScript
+  <name>.bc                LLVM bitcode
+  <name>.o                 LLVM bitcode
+
+The -c option (which tells gcc not to run the linker) will
+cause LLVM bitcode to be generated, as %s only generates
+JavaScript in the final linking stage of building.
+
+The input file(s) can be either source code files that
+Clang can handle (C or C++), LLVM bitcode in binary form,
+or LLVM assembly files in human-readable form.
+
+''' % (this, this, this)
+  exit(0)
+
+# If this is a configure-type thing, do not compile to JavaScript, instead use clang
+# to compile to a native binary (using our headers, so things make sense later)
+CONFIGURE_CONFIG = os.environ.get('EMMAKEN_JUST_CONFIGURE')
+CMAKE_CONFIG = 'CMakeFiles/cmTryCompileExec.dir' in ' '.join(sys.argv)# or 'CMakeCCompilerId' in ' '.join(sys.argv)
+if CONFIGURE_CONFIG or CMAKE_CONFIG:
+  compiler = shared.CLANG
+  if not ('CXXCompiler' in ' '.join(sys.argv) or os.environ.get('EMMAKEN_CXX')):
+    compiler = shared.to_cc(compiler)
+  cmd = [compiler] + shared.EMSDK_OPTS + sys.argv[1:]
+  if DEBUG: print >> sys.stderr, 'emcc, just configuring: ', compiler, cmd
+  exit(os.execvp(compiler, cmd))
+
+if os.environ.get('EMMAKEN_COMPILER'):
+  CXX = os.environ['EMMAKEN_COMPILER']
+else:
+  CXX = shared.CLANG
+
+CC = shared.to_cc(CXX)
+
+# If we got here from a redirection through emmakenxx.py, then force a C++ compiler here
+if os.environ.get('EMMAKEN_CXX'):
+  CC = CXX
+
+CC_ADDITIONAL_ARGS = shared.COMPILER_OPTS # + ['-g']?
+
+EMMAKEN_CFLAGS = os.environ.get('EMMAKEN_CFLAGS')
+if EMMAKEN_CFLAGS: CC_ADDITIONAL_ARGS += EMMAKEN_CFLAGS.split(' ')
+
+# ---------------- Utilities ---------------
+
+SOURCE_SUFFIXES = ('.c', '.cpp', '.cxx', '.cc')
+BITCODE_SUFFIXES = ('.bc', '.o', '.ll')
+
+def unsuffixed(name):
+  return '.'.join(name.split('.')[:-1])
+
+def unsuffixed_basename(name):
+  return os.path.basename(unsuffixed(name))
+
+LLVM_INTERNAL_OPT_LEVEL = 2
+
+# ---------------- End configs -------------
+
+if len(sys.argv) == 1 or sys.argv[1] in ['x', 't']:
+  # noop ar
+  if DEBUG: print >> sys.stderr, 'emcc, just ar'
+  sys.exit(0)
+
+use_cxx = True
+header = False # pre-compiled headers. We fake that by just copying the file
+
+for i in range(1, len(sys.argv)):
+  arg = sys.argv[i]
+  if not arg.startswith('-'):
+    if arg.endswith('.c'):
+      use_cxx = False
+    if arg.endswith('.h') and sys.argv[i-1] != '-include':
+      header = True
+
+# Check if a target is specified
+target = None
+for i in range(len(sys.argv)-1):
+  if sys.argv[i].startswith('-o='):
+    raise Exception('Invalid syntax: do not use -o=X, use -o X')
+
+  if sys.argv[i] == '-o':
+    target = sys.argv[i+1]
+    sys.argv = sys.argv[:i] + sys.argv[i+2:]
+    break
+
+if header: # header or such
+  if DEBUG: print >> sys.stderr, 'Just copy.'
+  shutil.copy(sys.argv[-1], sys.argv[-2])
+  exit(0)
+
+if TEMP_DIR:
+  temp_dir = TEMP_DIR
+  if os.path.exists(temp_dir):
+    shutil.rmtree(temp_dir) # clear it
+  os.makedirs(temp_dir)
+else:
+  temp_dir = tempfile.mkdtemp()
+
+def in_temp(name):
+  return os.path.join(temp_dir, name)
+
+try:
+  call = CXX if use_cxx else CC
+
+  ## Parse args
+
+  newargs = sys.argv[1:]
+
+  opt_level = 0
+  llvm_opt_level = None
+  closure = None
+
+  def check_bad_eq(arg):
+    assert '=' not in arg, 'Invalid parameter (do not use "=" with "--" options)'
+
+  for i in range(len(newargs)):
+    if newargs[i].startswith('-O'):
+      try:
+        opt_level = int(newargs[i][2])
+        assert 0 <= opt_level <= 3
+      except:
+        raise Exception('Invalid optimization level: ' + newargs[i])
+      newargs[i] = ''
+    elif newargs[i].startswith('--llvm-opts'):
+      check_bad_eq(newargs[i])
+      llvm_opt_level = eval(newargs[i+1])
+      assert 0 <= llvm_opt_level <= 1, 'Only two levels of LLVM optimizations are supported so far, 0 (none) and 1 (safe)'
+      newargs[i] = ''
+      newargs[i+1] = ''
+    elif newargs[i].startswith('--closure'):
+      check_bad_eq(newargs[i])
+      closure = int(newargs[i+1])
+      newargs[i] = ''
+      newargs[i+1] = ''
+    elif newargs[i] == '-MF': # clang cannot handle this, so we fake it
+      f = open(newargs[i+1], 'w')
+      f.write('\n')
+      f.close()
+      newargs[i] = ''
+      newargs[i+1] = ''
+  newargs = [ arg for arg in newargs if arg is not '' ]
+
+  if llvm_opt_level is None: llvm_opt_level = 1 if opt_level >= 1 else 0
+  if closure is None: closure = 1 if opt_level >= 2 else 0
+
+  if closure:
+    assert os.path.exists(shared.CLOSURE_COMPILER), 'emcc: fatal: Closure compiler (%s) does not exist' % shared.CLOSURE_COMPILER
+
+  settings_changes = []
+  for i in range(len(newargs)):
+    if newargs[i] == '-s':
+      assert '=' in newargs[i+1], 'Incorrect syntax for -s (use -s OPT=VAL): ' + newargs[i+1]
+      settings_changes.append(newargs[i+1])
+      newargs[i] = newargs[i+1] = ''
+    elif newargs[i].startswith('--typed-arrays'):
+      assert '=' not in newargs[i], 'Invalid typed arrays parameter (do not use "=")'
+      settings_changes.append('USE_TYPED_ARRAYS=' + newargs[i+1])
+      newargs[i] = ''
+      newargs[i+1] = ''
+  newargs = [ arg for arg in newargs if arg is not '' ]
+
+  input_files = []
+  has_source_inputs = False
+  for i in range(len(newargs)): # find input files XXX this a simple heuristic. we should really analyze based on a full understanding of gcc params,
+                                # right now we just assume that what is left contains no more |-x OPT| things
+    arg = newargs[i]
+    if arg.endswith(SOURCE_SUFFIXES + BITCODE_SUFFIXES): # we already removed -o <target>, so all these should be inputs
+      newargs[i] = ''
+      if os.path.exists(arg):
+        if arg.endswith(SOURCE_SUFFIXES):
+          input_files.append(arg)
+          has_source_inputs = True
+        else:
+          # this should be bitcode, make sure it is valid
+          if arg.endswith('.ll') or shared.Building.is_bitcode(arg):
+            input_files.append(arg)
+          else:
+            print >> sys.stderr, 'emcc: %s: Not valid LLVM bitcode' % arg
+      else:
+        print >> sys.stderr, 'emcc: %s: No such file or directory' % arg
+  newargs = [ arg for arg in newargs if arg is not '' ]
+
+  assert len(input_files) > 0, 'emcc: no input files'
+
+  newargs += CC_ADDITIONAL_ARGS
+
+  specified_target = target
+  target = specified_target if specified_target is not None else 'a.out.js' # specified_target is the user-specified one, target is what we will generate
+
+  target_basename = unsuffixed_basename(target)
+
+  # -c means do not link in gcc, and for us, the parallel is to not go all the way to JS, but stop at bitcode
+  has_dash_c = '-c' in newargs
+  if has_dash_c:
+    assert has_source_inputs, 'Must have source code inputs to use -c'
+    target = target_basename + '.o'
+
+  final_suffix = target.split('.')[-1]
+
+  # Apply optimization level settings
+  if opt_level >= 1:
+    shared.Settings.ASSERTIONS = 0
+    shared.Settings.DISABLE_EXCEPTION_CATCHING = 1
+  if opt_level >= 2:
+    shared.Settings.RELOOP = 1
+  if opt_level >= 3:
+    shared.Settings.CORRECT_SIGNS = 0
+    shared.Settings.CORRECT_OVERFLOWS = 0
+    shared.Settings.CORRECT_ROUNDINGS = 0
+    shared.Settings.I64_MODE = 0
+    shared.Settings.DOUBLE_MODE = 0
+    print >> sys.stderr, 'Warning: Applying some potentially unsafe optimizations! (Use -O2 if this fails.)'
+
+  # Apply -s settings in newargs here (after optimization levels, so they can override them)
+  for change in settings_changes:
+    key, value = change.split('=')
+    exec('shared.Settings.' + key + ' = ' + value)
+
+  ## Compile source code to bitcode
+
+  if DEBUG: print >> sys.stderr, 'emcc: compiling to bitcode (%s)' % str(sys.argv)
+
+  # First, generate LLVM bitcode. For each input file, we get base.o with bitcode
+  for input_file in input_files:
+    if input_file.endswith(SOURCE_SUFFIXES):
+      output_file = in_temp(unsuffixed_basename(input_file) + '.o')
+      args = newargs + ['-emit-llvm', '-c', input_file, '-o', output_file]
+      if DEBUG: print >> sys.stderr, "emcc running:", call, ' '.join(args)
+      Popen([call] + args).communicate() # let compiler frontend print directly, so colors are saved (PIPE kills that)
+      if not os.path.exists(output_file):
+        print >> sys.stderr, 'emcc: compiler frontend failed to generate LLVM bitcode, halting'
+        sys.exit(1)
+    else: # bitcode
+      if input_file.endswith(('.bc', '.o')):
+        shutil.copyfile(input_file, in_temp(unsuffixed_basename(input_file) + '.o'))
+      else: #.ll
+        shared.Building.llvm_as(input_file, in_temp(unsuffixed_basename(input_file) + '.o'))
+
+  # Optimize, if asked to
+  if llvm_opt_level > 0:
+    if DEBUG: print >> sys.stderr, 'emcc: LLVM opts'
+    for input_file in input_files:
+      try:
+        shared.Building.llvm_opt(in_temp(unsuffixed_basename(input_file) + '.o'), LLVM_INTERNAL_OPT_LEVEL, safe=llvm_opt_level < 2)
+      except:
+        # This might be an invalid input, which will get ignored during linking later anyhow
+        print >> sys.stderr, 'emcc: warning: LLVM opt failed to run on %s, continuing without optimization' % input_file
+
+  # If we were just asked to generate bitcode, stop there
+  if final_suffix not in ['js', 'html']:
+    if not specified_target:
+      for input_file in input_files:
+        shutil.move(in_temp(unsuffixed_basename(input_file) + '.o'), unsuffixed_basename(input_file) + '.' + final_suffix)
+    else:
+      if len(input_files) == 1:
+        shutil.move(in_temp(unsuffixed_basename(input_files[0]) + '.o'), specified_target)
+      else:
+        assert not has_dash_c, 'fatal error: cannot specify -o with -c with multiple files' + str(sys.argv)
+        # We have a specified target (-o <target>), which is not JavaScript or HTML, and
+        # we have multiple files: Link them TODO: llvm link-time opts?
+        ld_args = map(lambda input_file: in_temp(unsuffixed_basename(input_file) + '.o'), input_files) + \
+                  ['-o', specified_target]
+                  #[arg.split('-Wl,')[1] for arg in filter(lambda arg: arg.startswith('-Wl,'), sys.argv)]
+        if DEBUG: print >> sys.stderr, 'emcc: link: ' + str(ld_args)
+        Popen([shared.LLVM_LINK] + ld_args).communicate()
+    exit(0)
+
+  ## Continue on to create JavaScript
+
+  if DEBUG: print >> sys.stderr, 'emcc: generating JavaScript'
+
+  extra_files_to_link = []
+
+  # Check if we need to include dlmalloc. Note that we assume a single symbol is enough to know if we have/do not have dlmalloc. If you
+  # include just a few symbols but want the rest, this will not work.
+  need_dlmalloc = False
+  has_dlmalloc = False
+  for input_file in input_files:
+    symbols = shared.Building.llvm_nm(in_temp(unsuffixed_basename(input_file) + '.o'))
+    for malloc_def in ['malloc', 'free', 'calloc', 'memalign', 'realloc', 'valloc', 'pvalloc', 'mallinfo', 'mallopt', 'malloc_trim', 'malloc_stats', 'malloc_usable_size', 'malloc_footprint', 'malloc_max_footprint', 'independent_calloc', 'independent_comalloc']:
+      if malloc_def in symbols.undefs:
+        need_dlmalloc = True
+      if malloc_def in symbols.defs:
+        has_dlmalloc = True
+  if need_dlmalloc and not has_dlmalloc:
+    # We need to build and link dlmalloc in
+    if DEBUG: print >> sys.stderr, 'emcc: including dlmalloc'
+    Popen([shared.EMCC, shared.path_from_root('src', 'dlmalloc.c'), '-g', '-o', in_temp('dlmalloc.o')], stdout=PIPE, stderr=PIPE).communicate()
+    if llvm_opt_level > 0:
+      shared.Building.llvm_opt(in_temp('dlmalloc.o'), LLVM_INTERNAL_OPT_LEVEL, safe=llvm_opt_level < 2)
+    extra_files_to_link.append(in_temp('dlmalloc.o'))
+
+    # dlmalloc needs some sign correction. # If we are in mode 0, switch to 2. We will add our lines
+    try:
+      if shared.Settings.CORRECT_SIGNS == 0: raise Exception('we need to change to 2')
+    except: # we fail if equal to 0 - so we need to switch to 2 - or if CORRECT_SIGNS is not even in Settings
+      shared.Settings.CORRECT_SIGNS = 2
+    if shared.Settings.CORRECT_SIGNS == 2:
+      shared.Settings.CORRECT_SIGNS_LINES = [shared.path_from_root('src', 'dlmalloc.c') + ':' + str(i+4) for i in [4816, 4191, 4246, 4199, 4205, 4235, 4227]]
+    # If we are in mode 1, we are correcting everything anyhow. If we are in mode 3, we will be corrected
+    # so all is well anyhow too.
+
+  # First, combine the bitcode files if there are several
+  if len(input_files) + len(extra_files_to_link) > 1:
+    shared.Building.link(map(lambda input_file: in_temp(unsuffixed_basename(input_file) + '.o'), input_files) + extra_files_to_link,
+                         in_temp(target_basename + '.bc'))
+    # TODO: LLVM link-time opts? here and/or elsewhere?
+  else:
+    shutil.move(in_temp(unsuffixed_basename(input_files[0]) + '.o'), in_temp(target_basename + '.bc'))
+
+  # Emscripten
+  if opt_level >= 2:
+    print >> sys.stderr, 'Warning: The relooper optimization can be very slow.'
+
+  final = shared.Building.emscripten(in_temp(target_basename + '.bc'), append_ext=False)
+
+  if opt_level >= 1:
+    # js optimizer
+    if DEBUG: print >> sys.stderr, 'emcc: running pre-closure post-opts'
+    final = shared.Building.js_optimizer(final, 'loopOptimizer')
+
+    # eliminator
+    final = shared.Building.eliminator(final)
+
+    # js optimizer pre-pass
+    final = shared.Building.js_optimizer(final, 'simplifyExpressionsPre')
+
+  if closure:
+    if DEBUG: print >> sys.stderr, 'emcc: running closure'
+    final = shared.Building.closure_compiler(final)
+
+  if opt_level >= 1:
+    # js optimizer post-pass
+    if DEBUG: print >> sys.stderr, 'emcc: running post-closure post-opts'
+    final = shared.Building.js_optimizer(final, 'simplifyExpressionsPost')
+
+  # If we were asked to also generate HTML, do that
+  if final_suffix == 'html':
+    if DEBUG: print >> sys.stderr, 'emcc: generating HTML'
+    shell = open(shared.path_from_root('src', 'shell.html')).read()
+    html = open(target_basename + '.html', 'w')
+    html.write(shell.replace('{{{ SCRIPT_CODE }}}', open(final).read()))
+    html.close()
+  else:
+    # copy final JS to output
+    shutil.move(final, target_basename + '.js')
+
+finally:
+  if not TEMP_DIR:
+    try:
+      shutil.rmtree(temp_dir)
+    except:
+      pass
+  else:
+    print >> sys.stderr, 'emcc saved files are in:', temp_dir
+
