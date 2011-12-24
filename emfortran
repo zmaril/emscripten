@@ -37,6 +37,8 @@ elif sys.argv[1] == '--help':
 
   print '''%s [options] file...
 
+!!!!!!!!!!This may or may not work yet. !!!!!!!!
+
 Most normal gcc/g++ options will work, for example:
   --help                   Display this information
   --version                Display compiler version information
@@ -111,14 +113,12 @@ CC = shared.to_cc(CXX)
 if os.environ.get('EMMAKEN_CXX'):
   CC = CXX
 
-CC_ADDITIONAL_ARGS = shared.COMPILER_OPTS # + ['-g']?
-
 EMMAKEN_CFLAGS = os.environ.get('EMMAKEN_CFLAGS')
 if EMMAKEN_CFLAGS: CC_ADDITIONAL_ARGS += EMMAKEN_CFLAGS.split(' ')
 
 # ---------------- Utilities ---------------
 
-SOURCE_SUFFIXES = ('.c', '.cpp', '.cxx', '.cc')
+SOURCE_SUFFIXES = ('.f',)
 BITCODE_SUFFIXES = ('.bc', '.o', '.ll')
 
 def unsuffixed(name):
@@ -133,7 +133,7 @@ LLVM_INTERNAL_OPT_LEVEL = 2
 
 if len(sys.argv) == 1 or sys.argv[1] in ['x', 't']:
   # noop ar
-  if DEBUG: print >> sys.stderr, 'emcc, just ar'
+  if DEBUG: print >> sys.stderr, 'emfortran, just ar'
   sys.exit(0)
 
 use_cxx = True
@@ -175,7 +175,7 @@ def in_temp(name):
   return os.path.join(temp_dir, name)
 
 try:
-  call = CXX if use_cxx else CC
+  call = shared.GCC_DRAGON
 
   ## Parse args
 
@@ -239,7 +239,8 @@ try:
   for i in range(len(newargs)): # find input files XXX this a simple heuristic. we should really analyze based on a full understanding of gcc params,
                                 # right now we just assume that what is left contains no more |-x OPT| things
     arg = newargs[i]
-    if arg.endswith(SOURCE_SUFFIXES + BITCODE_SUFFIXES): # we already removed -o <target>, so all these should be inputs
+    if arg.endswith(SOURCE_SUFFIXES + BITCODE_SUFFIXES): # we already
+      # removed -o <target>, so all these should be inputs
       newargs[i] = ''
       if os.path.exists(arg):
         if arg.endswith(SOURCE_SUFFIXES):
@@ -256,8 +257,6 @@ try:
   newargs = [ arg for arg in newargs if arg is not '' ]
 
   assert len(input_files) > 0, 'emcc: no input files'
-
-  newargs += CC_ADDITIONAL_ARGS
 
   specified_target = target
   target = specified_target if specified_target is not None else 'a.out.js' # specified_target is the user-specified one, target is what we will generate
@@ -299,11 +298,11 @@ try:
   for input_file in input_files:
     if input_file.endswith(SOURCE_SUFFIXES):
       output_file = in_temp(unsuffixed_basename(input_file) + '.o')
-      args = newargs + ['-emit-llvm', '-c', input_file, '-o', output_file]
+      args = newargs + ['-c',input_file, '-o', output_file, "-fplugin="+shared.DRAGONEGG]
       if DEBUG: print >> sys.stderr, "emcc running:", call, ' '.join(args)
       Popen([call] + args).communicate() # let compiler frontend print directly, so colors are saved (PIPE kills that)
       if not os.path.exists(output_file):
-        print >> sys.stderr, 'emcc: compiler frontend failed to generate LLVM bitcode, halting'
+        print >> sys.stderr, 'emfortran: compiler frontend failed to generate LLVM bitcode, halting'
         sys.exit(1)
     else: # bitcode
       if input_file.endswith(('.bc', '.o')):

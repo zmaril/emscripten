@@ -287,6 +287,8 @@ Settings.reset()
 
 class Building:
   COMPILER = CLANG
+  GCC_DRAGON = GCC_DRAGON
+  DRAGONEGG = DRAGONEGG
   LLVM_OPTS = False
   COMPILER_TEST_OPTS = []
 
