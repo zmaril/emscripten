@@ -5,6 +5,11 @@ EMSCRIPTEN_ROOT = os.path.expanduser('~/Dev/emscripten') # this helps projects u
 
 LLVM_ROOT = os.path.expanduser('~/Dev/llvm-3.0/cbuild/bin')
 
+#Variables set up to tell the computer about dragonegg. Not needed if
+#there is no Fortran involved in your project. 
+GCC_DRAGON= os.path.expanduser('~/bin/gcc-4.6')
+DRAGONEGG = os.path.expanduser('~/dev/dragonegg.so')
+
 # See below for notes on which JS engine(s) you need
 NODE_JS = 'node'
 SPIDERMONKEY_ENGINE = [os.path.expanduser('~/Dev/mozilla-central/js/src/js'), '-m', '-n']
