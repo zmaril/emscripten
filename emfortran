@@ -298,9 +298,11 @@ try:
   for input_file in input_files:
     if input_file.endswith(SOURCE_SUFFIXES):
       output_file = in_temp(unsuffixed_basename(input_file) + '.o')
-      args = newargs + ['-c',input_file, '-o', output_file, "-fplugin="+shared.DRAGONEGG]
-      if DEBUG: print >> sys.stderr, "emcc running:", call, ' '.join(args)
+      # Complie with Dragonegg
+      args = newargs + [input_file, '-o', output_file, "-fplugin="+shared.DRAGONEGG, '-S']
+      if DEBUG: print >> sys.stderr, "emfortran running:", call, ' '.join(args)
       Popen([call] + args).communicate() # let compiler frontend print directly, so colors are saved (PIPE kills that)
+
       if not os.path.exists(output_file):
         print >> sys.stderr, 'emfortran: compiler frontend failed to generate LLVM bitcode, halting'
         sys.exit(1)
@@ -308,7 +310,7 @@ try:
       if input_file.endswith(('.bc', '.o')):
         shutil.copyfile(input_file, in_temp(unsuffixed_basename(input_file) + '.o'))
       else: #.ll
-        shared.Building.llvm_as(input_file, in_temp(unsuffixed_basename(input_file) + '.o'))
+        shared.Building.llvm_as(input_file, in_temp(unsuffixed_basename(input_file) + '.ll'))
 
   # Optimize, if asked to
   if llvm_opt_level > 0:
@@ -350,7 +352,9 @@ try:
   need_dlmalloc = False
   has_dlmalloc = False
   for input_file in input_files:
+    print 'llvm_nm ?'
     symbols = shared.Building.llvm_nm(in_temp(unsuffixed_basename(input_file) + '.o'))
+    print 'llvm_nm ?'
     for malloc_def in ['malloc', 'free', 'calloc', 'memalign', 'realloc', 'valloc', 'pvalloc', 'mallinfo', 'mallopt', 'malloc_trim', 'malloc_stats', 'malloc_usable_size', 'malloc_footprint', 'malloc_max_footprint', 'independent_calloc', 'independent_comalloc']:
       if malloc_def in symbols.undefs:
         need_dlmalloc = True
